@@ -436,4 +436,225 @@ def extract_article_body_selenium(driver, url: str):
         return '', ''
 
 # End of Part2
+# -------------------------------------------------------------
+# Part 3/4 — GUI ロジック（検索、バックグラウンド本文取得、Tree操作）
+# -------------------------------------------------------------
+
+class ArticleCache:
+    """URL → (title, body) を保持"""
+    def __init__(self):
+        self.data = {}
+
+    def put(self, url, title, body):
+        self.data[url] = (title, body)
+
+    def get(self, url):
+        return self.data.get(url, ("", ""))
+
+    def has(self, url):
+        return url in self.data
+
+
+class JWSearcher:
+    """Google検索を使って記事URLを収集し、必要に応じて Selenium で補完"""
+    def __init__(self):
+        service = Service(EDGE_DRIVER_PATH)
+        self.driver = webdriver.Edge(service=service)
+        self.driver.set_window_size(1300, 1000)
+        print("EdgeDriver 起動 OK")
+
+    def google_collect(self, keyword, mode, max_items):
+        """
+        mode = 'rel' | 'date'
+        'date' は日付優先：site:jw.org/ja + YYYYフィルタ追加
+        """
+        if mode == 'rel':
+            q = f"site:jw.org/ja {keyword}"
+        else:
+            q = f"site:jw.org/ja {keyword} 2024 OR 2023 OR 2022 OR 2021"
+
+        print(f"[Google] mode={mode} keyword='{keyword}' → start collecting…")
+        urls = google_collect_urls(self.driver, q, max_items=max_items)
+        print(f"[Google] collected {len(urls)} items")
+        return urls
+
+    def fetch_body(self, url, cache: ArticleCache):
+        """cache に無ければ取得（requests → selenium fallback）"""
+        if cache.has(url):
+            return cache.get(url)
+
+        # try requests
+        title, body = extract_article_body_requests(url)
+        if title and body:
+            cache.put(url, title, body)
+            return title, body
+
+        # fallback: selenium
+        print("requests failed → Selenium fallback:", url)
+        title, body = extract_article_body_selenium(self.driver, url)
+        if title and body:
+            cache.put(url, title, body)
+        return title, body
+
+
+class JWAppGUI:
+    """Tk + Selenium + Google 検索のメインアプリケーション"""
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("JW.org 自動検索・抽出・要約アプリ v12 — fixed9 (Google対応)")
+        self.root.geometry("1350x900")
+
+        self.searcher = JWSearcher()
+        self.cache = ArticleCache()
+        self.excel = ExcelWriter()
+
+        self.current_url = None
+        self.tree_items = []  # list of URLs に対応
+
+        self._build_ui()
+
+    # -----------------------------------------------------
+    def _build_ui(self):
+        top = ttk.Frame(self.root, padding=6)
+        top.pack(fill="x")
+
+        ttk.Label(top, text="検索語：").pack(side="left")
+        self.ent_kw = ttk.Entry(top, width=30)
+        self.ent_kw.pack(side="left", padx=4)
+
+        ttk.Label(top, text="関連度 件数：").pack(side="left", padx=(15,0))
+        self.var_rel = tk.IntVar(value=MAX_PER_MODE)
+        ttk.Entry(top, textvariable=self.var_rel, width=5).pack(side="left")
+
+        ttk.Label(top, text="新しい順 件数：").pack(side="left", padx=(15,0))
+        self.var_date = tk.IntVar(value=MAX_PER_MODE)
+        ttk.Entry(top, textvariable=self.var_date, width=5).pack(side="left")
+
+        ttk.Button(top, text="検索開始", command=self.start_search).pack(side="left", padx=10)
+
+        # Selection buttons
+        ttk.Button(top, text="全選択", command=self.select_all).pack(side="left", padx=4)
+        ttk.Button(top, text="全解除", command=self.clear_selection).pack(side="left", padx=4)
+
+        # -----------------------------------------
+        # Paned window
+        pan = ttk.Panedwindow(self.root, orient="horizontal")
+        pan.pack(fill="both", expand=True)
+
+        # 左ペイン
+        left = ttk.Frame(pan)
+        pan.add(left, weight=1)
+
+        self.tree = ttk.Treeview(
+            left,
+            columns=("url",),
+            show="headings",
+            selectmode="extended"
+        )
+        self.tree.heading("url", text="抽出されたURL（コピー可）")
+        self.tree.column("url", width=450)
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self.on_tree_dblclick)
+
+        # copy on ctrl+c
+        self.tree.bind("<Control-c>", self.copy_selected_urls)
+
+        # 右ペイン
+        right = ttk.Frame(pan)
+        pan.add(right, weight=3)
+
+        # 本文表示
+        self.txt_body = tk.Text(right, wrap="word")
+        self.txt_body.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # 要約ボタン
+        ttk.Button(right, text="要約生成", command=self.make_summary).pack(pady=3)
+
+        # 要約表示
+        self.txt_summary = tk.Text(right, wrap="word", height=8)
+        self.txt_summary.pack(fill="x", padx=4, pady=4)
+
+    # -----------------------------------------------------
+    def start_search(self):
+        kw = self.ent_kw.get().strip()
+        if not kw:
+            messagebox.showwarning("警告", "検索語を入力してください。")
+            return
+
+        print("=== 検索開始 ===")
+
+        # clear UI
+        self.tree.delete(*self.tree.get_children())
+        self.cache = ArticleCache()
+        self.txt_body.delete("1.0", "end")
+        self.txt_summary.delete("1.0", "end")
+        self.tree_items = []
+
+        # Google 関連度
+        rel_n = self.var_rel.get()
+        rel_urls = self.searcher.google_collect(kw, "rel", rel_n)
+
+        # Google 新しい順（日付キーワード追加）
+        date_n = self.var_date.get()
+        date_urls = self.searcher.google_collect(kw, "date", date_n)
+
+        # combine
+        all_urls = rel_urls + [u for u in date_urls if u not in rel_urls]
+        print(f"総取得 URL：{len(all_urls)} 件")
+
+        # add to tree
+        for u in all_urls:
+            iid = self.tree.insert("", "end", values=(u,))
+            self.tree_items.append(u)
+
+        # background fetch
+        threading.Thread(target=self._background_fetch_bodies, daemon=True).start()
+
+    # -----------------------------------------------------
+    def _background_fetch_bodies(self):
+        print("=== 本文バックグラウンド取得開始 ===")
+        for u in self.tree_items:
+            if not self.cache.has(u):
+                title, body = self.searcher.fetch_body(u, self.cache)
+                if title and body:
+                    print(f"[OK] {title[:20]}…")
+                else:
+                    print(f"[NG] 本文なし：{u}")
+        print("=== 本文バックグラウンド取得完了 ===")
+
+    # -----------------------------------------------------
+    def on_tree_dblclick(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        url = self.tree.item(sel[0], "values")[0]
+        self.current_url = url
+
+        title, body = self.cache.get(url)
+        if not body:
+            print("cacheなし → 取得中…")
+            title, body = self.searcher.fetch_body(url, self.cache)
+
+        self.txt_body.delete("1.0", "end")
+        self.txt_body.insert("end", f"【タイトル】\n{title}\n\n【URL】\n{url}\n\n【本文】\n{body}")
+
+    # -----------------------------------------------------
+    def copy_selected_urls(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        urls = []
+        for iid in sel:
+            u = self.tree.item(iid, "values")[0]
+            urls.append(u)
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(urls))
+        print("コピーしました")
+
+    # -----------------------------------------------------
+    def select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def clear_selection(self):
+        self.tree.selection_remove(self.tree.get_children())
 
