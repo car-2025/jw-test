@@ -216,4 +216,224 @@ def make_edge_driver(headed=True, driver_path=EDGE_DRIVER_PATH, user_data_dir=ED
             raise
 
 # End of Part1
+# -------------------------------------------------------------
+# Part 2/4 — Google 検索収集 / 記事判定 / 本文抽出（requests → Selenium fallback）
+# -------------------------------------------------------------
+
+# ----------------------------
+# Google検索で jw.org の結果を集める
+# ----------------------------
+def google_collect_urls(driver, keyword: str, max_items=MAX_PER_MODE):
+    """
+    google.co.jp を使って site:jw.org + keyword の検索を行い、
+    最大 max_items 件の jw.org URL を取得する（重複排除）。
+    ページは num=10、start=0,10,20,... 最大5ページ（50件）。
+    """
+    results = []
+    seen = set()
+    pages = min((max_items + PAGE_STEP - 1) // PAGE_STEP, 5)
+
+    for p in range(pages):
+        start = p * PAGE_STEP
+        url = GOOGLE_SEARCH_TPL.format(requests.utils.requote_uri(keyword), PAGE_STEP, start)
+        try:
+            driver.get(url)
+        except Exception as e:
+            # navigation failed — try small wait and continue
+            print("Google page load failed:", e)
+            time.sleep(1.0)
+            continue
+
+        # small randomized wait to mimic human
+        time.sleep(0.9 + random.random() * 0.6)
+
+        # collect anchor hrefs
+        try:
+            anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        except Exception:
+            anchors = []
+
+        for a in anchors:
+            try:
+                href = a.get_attribute("href") or ""
+            except Exception:
+                continue
+            # filter Google redirect wrappers
+            if href.startswith("https://www.google.co.jp/url?q=") or href.startswith("https://www.google.com/url?q="):
+                m = re.search(r'[?&]q=([^&]+)', href)
+                if m:
+                    href = requests.utils.unquote(m.group(1))
+                else:
+                    continue
+            # ignore non-jw links
+            if BASE_DOMAIN not in href:
+                continue
+            # normalize (remove fragments)
+            href = href.split('#')[0].rstrip('/')
+            if href in seen:
+                continue
+            seen.add(href)
+            # keep only likely article URLs; is_article_url will be conservative
+            if is_article_url(href):
+                results.append(href)
+                if len(results) >= max_items:
+                    return results[:max_items]
+        # small delay between pages
+        time.sleep(0.4 + random.random() * 0.6)
+
+    return results[:max_items]
+
+
+# ----------------------------
+# 記事URL判定（より保守的）
+# ----------------------------
+def is_article_url(url: str) -> bool:
+    """
+    jw.org の記事ページを保守的に判定。
+    条件例：
+      - BASE_DOMAIN を含む
+      - /ja/ を含む（日本語ページ）
+      - '/d/' を含む（ドキュメントIDを持つ正式記事）
+      - または長い数値を含む末尾セグメント
+    除外：
+      - /topics/, /languages/, /library/ (一般目次)、/collections/ などの一覧系
+    """
+    if not url or BASE_DOMAIN not in url:
+        return False
+    u = url.lower()
+    # prefer Japanese pages
+    if "/ja/" not in u:
+        return False
+    # exclude list/index pages
+    exclude_patterns = [
+        "/topics/", "/languages/", "/collections/", "/library/", "/languages/", "/search?", "/sitemap", "/about/"
+    ]
+    for ex in exclude_patterns:
+        if ex in u:
+            return False
+    if u.endswith(".pdf"):
+        return False
+    # accept if contains /d/<digits>
+    if re.search(r'/d/\d{6,}', u):
+        return True
+    # accept if trailing numeric id
+    if re.search(r'/\d{6,}/?$', u):
+        return True
+    # otherwise conservative: reject
+    return False
+
+
+# ----------------------------
+# HTML -> タイトル, 本文 抽出ロジック（改良版）
+# ----------------------------
+ARTICLE_SELECTORS_PRIORITY = [
+    'article',
+    'div[data-test-id="article-body"]',
+    'div[class*="article"]',
+    'div[class*="article-body"]',
+    'div[class*="content__body"]',
+    'main',
+    'section'
+]
+
+def clean_text_block(text: str) -> str:
+    if not text:
+        return ''
+    text = re.sub(r'\r', '', text)
+    lines = [ln.strip() for ln in text.splitlines()]
+    out = []
+    for ln in lines:
+        if not ln:
+            out.append('')
+            continue
+        low = ln.lower()
+        if any(k in low for k in ['privacy', 'cookie', 'terms', 'copyright', '利用規約']):
+            continue
+        if len(ln) < 2:
+            continue
+        out.append(ln)
+    # collapse consecutive blanks
+    final = []
+    for ln in out:
+        if ln == '' and final and final[-1] == '':
+            continue
+        final.append(ln)
+    return '\n'.join(final).strip()
+
+def parse_article_html(html: str):
+    """
+    HTML文字列からタイトルと本文を返す（title, body）
+    本文は優先セレクタ順で長いブロックを採用し、日本語文字数フィルタあり
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    # title
+    title = ''
+    h1 = soup.find('h1')
+    if h1:
+        title = h1.get_text(strip=True)
+    elif soup.title:
+        title = soup.title.get_text(strip=True)
+
+    candidates = []
+    for sel in ARTICLE_SELECTORS_PRIORITY:
+        try:
+            el = soup.select_one(sel)
+        except Exception:
+            el = None
+        if el:
+            txt = el.get_text('\n', strip=True)
+            if len(txt) > 200:
+                candidates.append(txt)
+
+    # fallback: large divs with many <p>
+    if not candidates:
+        divs = soup.find_all('div')
+        for d in divs:
+            ps = d.find_all('p')
+            if len(ps) >= 3:
+                txt = d.get_text('\n', strip=True)
+                if len(txt) > 200:
+                    candidates.append(txt)
+
+    # last fallback: all <p>
+    if not candidates:
+        ps = soup.find_all('p')
+        body = '\n'.join([p.get_text(strip=True) for p in ps if p.get_text(strip=True)])
+        if len(body) < 200:
+            return title or '', ''
+        if jp_char_count(body) < 10:
+            return title or '', ''
+        return title or '', clean_text_block(body)
+
+    # pick longest candidate
+    body = max(candidates, key=lambda s: len(s))
+    if jp_char_count(body) < 15:
+        return title or '', ''
+    return title or '', clean_text_block(body)
+
+
+# ----------------------------
+# requestsベース取得（高速） + selenium fallback
+# ----------------------------
+def extract_article_body_requests(url: str):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            return '', ''
+        return parse_article_html(r.text)
+    except Exception:
+        return '', ''
+
+def extract_article_body_selenium(driver, url: str):
+    try:
+        driver.get(url)
+        WebDriverWait(driver, SELENIUM_PAGE_TIMEOUT).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'body')))
+        time.sleep(0.5 + random.random() * 0.6)
+        html = driver.page_source
+        return parse_article_html(html)
+    except Exception as e:
+        print("Selenium article fetch failed:", e)
+        return '', ''
+
+# End of Part2
 
