@@ -480,4 +480,121 @@ class JWAppGUI:
         self.tree.tag_configure("unsel", background="white")
 
     # End of Part3
+# -------------------------------------------------------------
+# Part 4/4 — API要約・保存・起動ルーチン
+# -------------------------------------------------------------
+
+# ----------------------------
+# API 要約（簡易ラッパー）
+# ----------------------------
+def call_chatgpt_api(api_key: str, text: str, max_tokens: int = 400):
+    """
+    OpenAI Chat Completions の簡易呼び出し例。
+    ユーザーは有効な API key を設定してください。
+    """
+    if not api_key or not text:
+        return "APIキーまたは本文が空です"
+    try:
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": "gpt-4o-mini",  # 変更可
+            "messages": [
+                {"role": "system", "content": "あなたは日本語で記事の要約を作るアシスタントです。"},
+                {"role": "user", "content": f"次の本文を日本語で3文程度に要約してください：\n\n{text}"}
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.2
+        }
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+        if r.status_code == 200:
+            j = r.json()
+            choices = j.get("choices") or []
+            if choices:
+                # Chat completions の形式に依存
+                msg = choices[0].get("message") or {}
+                return msg.get("content", "") or choices[0].get("text", "")
+            return str(j)
+        else:
+            return f"API error {r.status_code}: {r.text[:400]}"
+    except Exception as e:
+        return f"API 呼び出し例外: {e}"
+
+# ----------------------------
+# JWApp GUI: API要約フック & 保存ロジック
+# ----------------------------
+def do_api_summary_for_url(app: JWAppGUI, url: str):
+    """
+    与えられた app インスタンスと URL に対して API 要約を呼ぶ（非同期）。
+    """
+    art = app.cache.get(url, ("",""))
+    if not art or not art[1]:
+        return "本文がありません"
+    api_key = app.api_key.get().strip()
+    if not api_key:
+        return "APIキーが未設定です"
+    body = art[1]
+    res = call_chatgpt_api(api_key, body)
+    # UI 更新は main スレッドで
+    def update_ui():
+        app.txt_sum.delete("1.0", "end")
+        app.txt_sum.insert("end", res)
+    app.master.after(0, update_ui)
+    # also save to excel
+    try:
+        app.excel.append([datetime.now().isoformat(), url, art[0], res, body])
+    except Exception:
+        pass
+    return "OK"
+
+# Batch operation used by the GUI button "選択記事を要約して Excel 保存"
+def batch_summarize_selected(app: JWAppGUI):
+    sel_urls = [u for u, v in app.selected.items() if v]
+    if not sel_urls:
+        messagebox.showinfo("Info", "選択された記事がありません。")
+        return
+    def worker():
+        for u in sel_urls:
+            # ensure cached
+            if not app.cache.get(u, ("",""))[1]:
+                title, body = extract_article_body_requests(u)
+                if not body:
+                    title, body = extract_article_body_selenium(app.driver, u)
+                app.cache[u] = (title or "", body or "")
+            # local summary first
+            title, body = app.cache[u]
+            summary = simple_summary(body, n_sentences=3) if body else ""
+            try:
+                app.excel.append([datetime.now().isoformat(), u, title, summary, body])
+            except Exception:
+                pass
+        app.master.after(0, lambda: messagebox.showinfo("完了", f"{len(sel_urls)} 件を保存しました。"))
+    threading.Thread(target=worker, daemon=True).start()
+
+# Hook the JWAppGUI method to call batch summary
+JWAppGUI.do_summary_all = lambda self: batch_summarize_selected(self)
+JWAppGUI.api_summarize_single = lambda self: do_api_summary_for_url(self, getattr(self, "current_url", None) or "")
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
+def main():
+    root = tk.Tk()
+    app = JWAppGUI(root)
+    # intercept close to quit driver safely
+    def on_close():
+        try:
+            if hasattr(app, "driver") and app.driver:
+                try:
+                    app.driver.quit()
+                except:
+                    pass
+        except:
+            pass
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
 
