@@ -295,4 +295,189 @@ def extract_article_body_selenium(driver, url: str):
 
 
 # End of Part2
+# -------------------------------------------------------------
+# Part 3/4 — GUI（左右ペイン／URLリスト／本文／要約エリア）
+# -------------------------------------------------------------
+
+class JWAppGUI:
+    def __init__(self, master):
+        self.master = master
+        master.title("JW.org 検索・抽出・要約アプリ v12 (Edge, fixed8 Google版)")
+        master.geometry("1400x900")
+
+        # 状態管理
+        self.driver = make_edge_driver(headed=True)
+        self.excel = ExcelWriter()
+        self.cache = {}        # url → (title, body)
+        self.current_url = None
+        self.selected = {}      # url → bool（チェック状態）
+        self.api_key = tk.StringVar()  # 要約APIキー
+
+        self._build_ui()
+
+    # GUI構築
+    def _build_ui(self):
+        # 上部コントロールバー
+        top = ttk.Frame(self.master, padding=6)
+        top.pack(fill="x")
+
+        ttk.Label(top, text="検索語:").pack(side="left")
+        self.ent_kw = ttk.Entry(top, width=30)
+        self.ent_kw.pack(side="left", padx=4)
+
+        ttk.Label(top, text="関連度 件数(max50):").pack(side="left")
+        self.var_rel = tk.IntVar(value=20)
+        ttk.Entry(top, textvariable=self.var_rel, width=6).pack(side="left")
+
+        ttk.Label(top, text="新しい順 件数(max50):").pack(side="left")
+        self.var_new = tk.IntVar(value=20)
+        ttk.Entry(top, textvariable=self.var_new, width=6).pack(side="left")
+
+        ttk.Button(top, text="検索開始", command=self.start_search).pack(side="left", padx=10)
+
+        # 左右分割
+        pan = ttk.Panedwindow(self.master, orient=tk.HORIZONTAL)
+        pan.pack(fill="both", expand=True)
+
+        # 左：URLリスト
+        left = ttk.Frame(pan)
+        pan.add(left, weight=1)
+
+        # チェックボックス画像
+        self.img_unchecked = tk.PhotoImage(width=20, height=20)
+        self.img_checked = tk.PhotoImage(width=20, height=20)
+        # 塗りつぶし
+        self.img_unchecked.put(("white",), to=(0, 0, 19, 19))
+        self.img_checked.put(("black",), to=(0, 0, 19, 19))
+
+        # Treeview（チェックボックス付）
+        self.tree = ttk.Treeview(left, columns=("url"), show="headings", height=25)
+        self.tree.heading("url", text="抽出URL（ダブルクリックで表示／コピー可）")
+        self.tree.pack(fill="both", expand=True)
+
+        self.tree.bind("<Double-1>", self.on_tree_double)
+
+        # ボタン行
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", pady=3)
+
+        ttk.Button(btns, text="全選択", command=self.select_all).pack(side="left", padx=4)
+        ttk.Button(btns, text="全解除", command=self.unselect_all).pack(side="left", padx=4)
+
+        # 右：本文表示エリア＋要約
+        right = ttk.Frame(pan)
+        pan.add(right, weight=3)
+
+        # 本文表示
+        frm_body = ttk.Labelframe(right, text="記事本文")
+        frm_body.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.txt_body = tk.Text(frm_body, wrap="word")
+        self.txt_body.pack(fill="both", expand=True)
+
+        # 要約とAPIキー欄
+        frm_sum = ttk.Labelframe(right, text="要約＆保存")
+        frm_sum.pack(fill="both", expand=False, padx=4, pady=4)
+
+        ttk.Label(frm_sum, text="APIキー:").pack(anchor="w")
+        ttk.Entry(frm_sum, textvariable=self.api_key, width=40).pack(anchor="w", padx=4, pady=2)
+
+        self.txt_sum = tk.Text(frm_sum, wrap="word", height=10)
+        self.txt_sum.pack(fill="x", padx=4, pady=4)
+
+        ttk.Button(frm_sum, text="選択記事を要約して Excel 保存", command=self.do_summary_all).pack(pady=4)
+
+    # ---------------------------------------------------------
+    # 検索開始
+    # ---------------------------------------------------------
+    def start_search(self):
+        kw = self.ent_kw.get().strip()
+        if not kw:
+            messagebox.showwarning("警告", "検索語を入力してください。")
+            return
+
+        rel_n = min(max(self.var_rel.get(), 1), MAX_PER_MODE)
+        new_n = min(max(self.var_new.get(), 1), MAX_PER_MODE)
+
+        # リストクリア
+        self.tree.delete(*self.tree.get_children())
+        self.cache.clear()
+        self.selected.clear()
+
+        print("Google検索で抽出を開始…")
+
+        # 関連度順（Google上位）
+        rel = google_search_collect(self.driver, kw, rel_n)
+
+        # 新しい順（docid降順）
+        all_for_date = google_search_collect(self.driver, kw, MAX_PER_MODE)
+        url_docid_pairs = []
+        for u in all_for_date:
+            docid = extract_docid_from_url(u)
+            if docid:
+                url_docid_pairs.append((u, docid))
+
+        url_docid_pairs.sort(key=lambda x: x[1], reverse=True)
+        date_urls = [u for (u, _) in url_docid_pairs[:new_n]]
+
+        # 重複を除いて結合
+        merged = rel + [u for u in date_urls if u not in rel]
+
+        print(f"抽出完了: {len(merged)} 件")
+        self.populate_tree(merged)
+
+    # TreeviewへURL挿入
+    def populate_tree(self, urls):
+        for u in urls:
+            self.selected[u] = False
+            self.tree.insert("", "end", iid=u, values=(u,))
+
+    # ---------------------------------------------------------
+    # Treeview行ダブルクリック → 右側に本文表示
+    # ---------------------------------------------------------
+    def on_tree_double(self, event):
+        item = self.tree.selection()
+        if not item:
+            return
+        url = item[0]
+        self.current_url = url
+
+        # まだ取得していない場合は本文抽出
+        if url not in self.cache:
+            title, body = extract_article_body_requests(url)
+            if not body:
+                title, body = extract_article_body_selenium(self.driver, url)
+            self.cache[url] = (title or "", body or "")
+
+        title, body = self.cache[url]
+
+        self.txt_body.delete("1.0", "end")
+        self.txt_body.insert("end", f"【タイトル】\n{title}\n\n【URL】\n{url}\n\n【本文】\n{body}")
+
+    # ---------------------------------------------------------
+    # チェック操作
+    # ---------------------------------------------------------
+    def select_all(self):
+        for u in list(self.selected.keys()):
+            self.selected[u] = True
+        print("全選択")
+        self._refresh_selection_states()
+
+    def unselect_all(self):
+        for u in list(self.selected.keys()):
+            self.selected[u] = False
+        print("全解除")
+        self._refresh_selection_states()
+
+    def _refresh_selection_states(self):
+        # Treeview の背景色で選択状態を見やすく
+        for u, sel in self.selected.items():
+            try:
+                self.tree.item(u, tags=("sel" if sel else "unsel"))
+            except:
+                pass
+        self.tree.tag_configure("sel", background="#d0ffd0")
+        self.tree.tag_configure("unsel", background="white")
+
+    # End of Part3
 
