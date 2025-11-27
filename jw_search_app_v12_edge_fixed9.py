@@ -496,7 +496,6 @@ class JWSearcher:
             cache.put(url, title, body)
         return title, body
 
-
 class JWAppGUI:
     """Tk + Selenium + Google 検索のメインアプリケーション"""
     def __init__(self, root: tk.Tk):
@@ -657,4 +656,56 @@ class JWAppGUI:
 
     def clear_selection(self):
         self.tree.selection_remove(self.tree.get_children())
+# -------------------------------------------------------------
+# Part 4/4 — 要約生成 + Excel 書き込み + main
+# -------------------------------------------------------------
+
+    # -----------------------------------------------------
+    def make_summary(self):
+        """非常にシンプルな3段落要約（必要に応じてAPI接続に置換可能）"""
+        if not self.current_url:
+            messagebox.showwarning("警告", "URLが選択されていません。")
+            return
+
+        title, body = self.cache.get(self.current_url)
+        if not body:
+            title, body = self.searcher.fetch_body(self.current_url, self.cache)
+            if not body:
+                messagebox.showwarning("警告", "本文が取得できませんでした。")
+                return
+
+        # 要約（3段落の先頭部分）
+        lines = [ln for ln in body.split("\n") if ln.strip()]
+        if not lines:
+            summary = ""
+        else:
+            summary = "。".join(lines[:3]) + "。"
+
+        # 表示
+        self.txt_summary.delete("1.0", "end")
+        self.txt_summary.insert("end", summary)
+
+        # Excel 保存
+        row = [
+            datetime.now().isoformat(),
+            self.current_url,
+            title,
+            summary,
+            body
+        ]
+        self.excel.append(row)
+        print("[Excel] 保存しました:", self.current_url)
+
+
+# -------------------------------------------------------------
+# main
+# -------------------------------------------------------------
+def main():
+    root = tk.Tk()
+    app = JWAppGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
 
