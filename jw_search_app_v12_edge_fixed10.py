@@ -200,3 +200,71 @@ def make_edge_driver(headed=True, driver_path=EDGE_DRIVER_PATH, user_data_dir=ED
             raise
 
 # End of Part1
+# jw_search_app_v12_edge_fixed10.py — Part2/4
+# === JW.org 公式検索（rel/date）URL収集ロジック ===
+
+# ---------------------------------------------------------
+# JW.org 公式検索：正規の検索URLで rel/date ページを巡回してリンク抽出
+# ---------------------------------------------------------
+def jw_search_collect(driver, keyword: str, mode: str, max_items=50):
+    """JW.org 公式検索ページから正規の検索結果のみ抽出する"""
+    assert mode in ("relevance", "date")
+    tpl = SEARCH_URL_RELEVANCE_TPL if mode == "relevance" else SEARCH_URL_DATE_TPL
+
+    collected = []
+    visited_urls = set()
+    pages = max(1, (max_items + PAGE_STEP - 1) // PAGE_STEP)
+
+    for idx in range(pages):
+        start = idx * PAGE_STEP
+        search_url = tpl.format(keyword, start)
+
+        try:
+            driver.get(search_url)
+        except Exception:
+            continue
+
+        # ページ読み込み待機
+        try:
+            WebDriverWait(driver, SELENIUM_PAGE_TIMEOUT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "main, body"))
+            )
+        except Exception:
+            time.sleep(1.2)
+
+        time.sleep(1.0 + random.uniform(0.3, 0.8))
+
+        # 検索結果が "該当なし" のケースを検出
+        html = driver.page_source
+        if "該当する結果は見つかりません" in html or "お探しのページが見つかりません" in html:
+            break
+
+        # --- 結果リンク抽出 ---
+        anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        for a in anchors:
+            try:
+                href = a.get_attribute("href")
+            except Exception:
+                continue
+            if not href:
+                continue
+            if href in visited_urls:
+                continue
+            visited_urls.add(href)
+
+            # JW.org 内部のみ
+            if not href.startswith(BASE_DOMAIN + "/ja/"):
+                continue
+
+            # カテゴリページなどは除外
+            if any(x in href for x in [
+                "/search/?", "/topics/", "/languages/", "/bible/", "/library/",
+                "/study-tools/", "/bible-teachings/", "/videos/", "/news/",
+                "/whats-new/"
+            ]):
+                continue
+
+            # 記事 URL 判定
+            # パターン： /d/123456789, /YYYYMM とか
+            if extract_docid_from_url(href) is None:
+                # docid
