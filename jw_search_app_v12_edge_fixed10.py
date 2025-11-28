@@ -519,3 +519,13 @@ class JWAppGUI:
         ])
 
 # End of Part3
+# jw_search_app_v12_edge_fixed10.py — Part4/4
+# === 起動部（main） ===
+
+def main():
+    root = tk.Tk()
+    app = JWAppGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
