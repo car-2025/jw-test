@@ -1,3 +1,70 @@
+# ============================================================
+# GoogleFallbackSearcher（fixed10 完全版）
+# JW公式検索が reCAPTCHA になるため Google検索へ切替する
+#  rel / date のソートを Google 側パラメータで実現
+# ============================================================
+
+class GoogleFallbackSearcher:
+    def __init__(self):
+        from selenium.webdriver.edge.service import Service
+        from selenium import webdriver
+
+        service = Service(EDGE_DRIVER_PATH)
+
+        options = webdriver.EdgeOptions()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+        options.add_experimental_option("detach", True)
+
+        self.driver = webdriver.Edge(service=service, options=options)
+        self.driver.set_window_size(1200, 900)
+
+        print("EdgeDriver 起動 OK")
+
+    # ---------------------------------------------------------
+    def google_fetch(self, keyword, mode, max_count):
+        """
+        Google で「site:jw.org <keyword>」検索を行い、記事URLだけ抽出。
+        mode = 'relevance' または 'date'
+        max_count = 上限件数
+        """
+
+        collected = []
+        page = 0
+
+        # Google のソートURL形式
+        if mode == "date":
+            tbs_param = "&tbs=qdr:y"  # 過去1年 ※必要なら調整可能
+        else:
+            tbs_param = ""            # relevance（デフォルト）
+
+        print(f"[Google] mode={mode} keyword='{keyword}' → start collecting…")
+
+        while len(collected) < max_count and page < 20:  # 最大 20 ページ（200件）
+            start = page * 10
+            url = f"https://www.google.com/search?q=site%3Ajw.org+{keyword}{tbs_param}&start={start}"
+
+            self.driver.get(url)
+            time.sleep(1.1)
+
+            # Google 検索結果のリンク要素
+            a_tags = self.driver.find_elements(By.CSS_SELECTOR, "a[href^='https://www.jw.org']")
+            for a in a_tags:
+                href = a.get_attribute("href")
+                if not href:
+                    continue
+                if href not in collected:
+                    collected.append(href)
+                    if len(collected) >= max_count:
+                        break
+
+            page += 1
+
+        print(f"[Google] collected {len(collected)} items")
+        return collected[:max_count]
+
 # jw_search_app_v12_edge_fixed10.py — Part 1/4
 # JW.org 自動検索・抽出・要約アプリ v12 fixed10
 # - JW.org 公式検索 (/ja/search/?q=...) を直接使用（Google廃止）
