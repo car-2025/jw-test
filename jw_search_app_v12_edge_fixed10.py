@@ -372,10 +372,8 @@ class JWAppGUI:
         master.title("JW.org 検索・抽出・要約アプリ v12 — fixed10")
         master.geometry("1300x800")
 
--        # Selenium 検索器
--        self.searcher = GoogleFallbackSearcher()
-+        # Selenium 検索器（JW.org公式検索を使う）
-+        self.searcher = JWOrgSearcher()
+        # Selenium 検索器（JW.org公式検索を使う）
+        self.searcher = JWOrgSearcher()
         self.cached_body = {}     # URL → (title, body)
         self.current_url = None
 
@@ -478,19 +476,12 @@ class JWAppGUI:
 
         print("=== 検索開始 ===")
 
--        # rel
--        rel_urls = self.searcher.google_fetch(kw, "relevance", rel_n)
--        print(f"[Google] rel collected {len(rel_urls)}")
--
--        # date
--        date_urls = self.searcher.google_fetch(kw, "date", date_n)
--        print(f"[Google] date collected {len(date_urls)}")
-+        # JW.org 公式検索で取得
-+        rel_urls = self.searcher.collect(kw, "relevance", rel_n)
-+        print(f"[JW.org] rel collected {len(rel_urls)}")
-+
-+        date_urls = self.searcher.collect(kw, "date", date_n)
-+        print(f"[JW.org] date collected {len(date_urls)}")
+        # JW.org 公式検索で取得
+        rel_urls = self.searcher.collect(kw, "relevance", rel_n)
+        print(f"[JW.org] rel collected {len(rel_urls)}")
+
+        date_urls = self.searcher.collect(kw, "date", date_n)
+        print(f"[JW.org] date collected {len(date_urls)}")
 
         date_urls = self.searcher.collect(kw, "date", date_n)
         print(f"[JW.org] date collected {len(date_urls)}")
