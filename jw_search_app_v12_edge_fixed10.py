@@ -267,4 +267,255 @@ def jw_search_collect(driver, keyword: str, mode: str, max_items=50):
             # 記事 URL 判定
             # パターン： /d/123456789, /YYYYMM とか
             if extract_docid_from_url(href) is None:
-                # docid
+                # docid が取れないページは本文が記事ではないのでスキップ
+                continue
+
+            collected.append(href)
+            if len(collected) >= max_items:
+                return collected
+
+        # 次ページが無ければ終了
+        if start > 0 and len(collected) == 0:
+            # rel=0/date=0 件 → もう出ない
+            break
+
+    return collected[:max_items]
+
+# ---------------------------------------------------------
+# 本文抽出（requests版）
+# ---------------------------------------------------------
+def extract_article_body(url: str):
+    """JW.org 記事ページの本文を正確に抽出する。カテゴリページは除外される"""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code != 200:
+            return "", ""
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # --- タイトル抽出 ---
+        title_el = soup.find("h1")
+        title = title_el.get_text(strip=True) if title_el else ""
+
+        # --- 本文抽出 ---
+        # パターン1: article[data-article-id]
+        body_container = soup.find("article")
+        if not body_container:
+            # パターン2: div class="content" / "body" / "article-body"
+            body_container = soup.find("div", class_=lambda c: c and ("content" in c or "body" in c))
+
+        if not body_container:
+            # パターン3: section 内の p
+            body_container = soup.find("section")
+
+        if not body_container:
+            # fallback: p を全部
+            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+            return title, "\n".join(paragraphs)
+
+        # 正規本文（p）抽出
+        ps = body_container.find_all("p")
+        body = "\n".join([p.get_text(" ", strip=True) for p in ps if p.get_text(strip=True)])
+
+        return title, body
+
+    except Exception:
+        return "", ""
+
+# End of Part2
+# jw_search_app_v12_edge_fixed10.py — Part3/4
+# === GUI + 検索処理 + 本文キャッシュ + 要約API入力欄 ===
+
+class JWAppGUI:
+    def __init__(self, master):
+        self.master = master
+        master.title("JW.org 検索・抽出・要約アプリ v12 — fixed10")
+        master.geometry("1300x800")
+
+        # Selenium 検索器
+        self.searcher = GoogleFallbackSearcher()
+        self.cached_body = {}     # URL → (title, body)
+        self.current_url = None
+
+        # Excel
+        self.excel = ExcelWriter()
+
+        # --- UI を構築 ---
+        self.build_ui()
+
+    # ---------------------------------------------------------
+    # UI 構築
+    # ---------------------------------------------------------
+    def build_ui(self):
+        top = ttk.Frame(self.master, padding=8)
+        top.pack(fill="x")
+
+        # 検索語
+        ttk.Label(top, text="検索語:").pack(side="left")
+        self.ent_keyword = ttk.Entry(top, width=30)
+        self.ent_keyword.pack(side="left", padx=5)
+
+        # 件数
+        ttk.Label(top, text="関連度 件数:").pack(side="left")
+        self.var_rel = tk.IntVar(value=50)
+        ttk.Entry(top, textvariable=self.var_rel, width=6).pack(side="left")
+
+        ttk.Label(top, text="新しい順 件数:").pack(side="left")
+        self.var_date = tk.IntVar(value=50)
+        ttk.Entry(top, textvariable=self.var_date, width=6).pack(side="left")
+
+        ttk.Button(top, text="検索開始", command=self.start_search).pack(side="left", padx=10)
+
+        # 要約API key
+        ttk.Label(top, text="要約APIキー:").pack(side="left", padx=8)
+        self.ent_api = ttk.Entry(top, width=40)
+        self.ent_api.pack(side="left", padx=5)
+
+        # -----------------------------------------------------
+        # 左右分割
+        pan = ttk.Panedwindow(self.master, orient=tk.HORIZONTAL)
+        pan.pack(fill="both", expand=True)
+
+        # --- 左側：URL リスト ---
+        left = ttk.Frame(pan, padding=5)
+        pan.add(left, weight=1)
+
+        self.tree = ttk.Treeview(left, columns=("url"), show="headings")
+        self.tree.heading("url", text="URL（ダブルクリックで本文表示）")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+        # 全選択/解除
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", pady=5)
+        ttk.Button(btns, text="全選択", command=self.select_all).pack(side="left", padx=4)
+        ttk.Button(btns, text="全解除", command=self.clear_all).pack(side="left", padx=4)
+
+        # --- 右側 ---
+        right = ttk.Frame(pan, padding=5)
+        pan.add(right, weight=3)
+
+        # 本文表示
+        ttk.Label(right, text="本文表示").pack(anchor="w")
+        self.txt_article = tk.Text(right, wrap="word", height=25)
+        self.txt_article.pack(fill="both", expand=True)
+
+        # 要約ボタン
+        ttk.Button(right, text="要約生成", command=self.make_summary).pack(pady=5)
+
+        # 要約表示
+        ttk.Label(right, text="要約結果").pack(anchor="w")
+        self.txt_summary = tk.Text(right, wrap="word", height=10)
+        self.txt_summary.pack(fill="x")
+
+    # ---------------------------------------------------------
+    # 全選択 / 全解除
+    # ---------------------------------------------------------
+    def select_all(self):
+        for iid in self.tree.get_children():
+            self.tree.selection_add(iid)
+
+    def clear_all(self):
+        self.tree.selection_remove(self.tree.get_children())
+
+    # ---------------------------------------------------------
+    # 検索開始
+    # ---------------------------------------------------------
+    def start_search(self):
+        kw = self.ent_keyword.get().strip()
+        if not kw:
+            messagebox.showwarning("警告", "検索語を入力してください")
+            return
+
+        rel_n = self.var_rel.get()
+        date_n = self.var_date.get()
+
+        self.tree.delete(*self.tree.get_children())
+        self.cached_body.clear()
+        self.current_url = None
+
+        print("=== 検索開始 ===")
+
+        # rel
+        rel_urls = self.searcher.google_fetch(kw, "relevance", rel_n)
+        print(f"[Google] rel collected {len(rel_urls)}")
+
+        # date
+        date_urls = self.searcher.google_fetch(kw, "date", date_n)
+        print(f"[Google] date collected {len(date_urls)}")
+
+        # 重複排除
+        all_urls = []
+        for u in rel_urls + date_urls:
+            if u not in all_urls:
+                all_urls.append(u)
+
+        print(f"総取得 URL：{len(all_urls)} 件")
+
+        # GUI に表示
+        for url in all_urls:
+            self.tree.insert("", "end", values=(url,))
+
+        # バックグラウンド本文取得
+        threading.Thread(target=self.fetch_body_background, args=(all_urls,), daemon=True).start()
+
+    # ---------------------------------------------------------
+    # バックグラウンド本文取得
+    # ---------------------------------------------------------
+    def fetch_body_background(self, urls):
+        print("=== 本文バックグラウンド取得開始 ===")
+        for url in urls:
+            if url not in self.cached_body:
+                title, body = extract_article_body(url)
+                self.cached_body[url] = (title, body)
+                time.sleep(0.3)
+        print("=== 本文バックグラウンド取得完了 ===")
+
+    # ---------------------------------------------------------
+    # URL ダブルクリック → 本文表示
+    # ---------------------------------------------------------
+    def on_tree_double_click(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        url = self.tree.item(sel[0], "values")[0]
+        self.current_url = url
+
+        if url not in self.cached_body:
+            title, body = extract_article_body(url)
+            self.cached_body[url] = (title, body)
+        else:
+            title, body = self.cached_body[url]
+
+        self.txt_article.delete("1.0", "end")
+        self.txt_article.insert(
+            "end",
+            f"【タイトル】\n{title}\n\n【URL】\n{url}\n\n【本文】\n{body}"
+        )
+
+    # ---------------------------------------------------------
+    # 要約
+    # ---------------------------------------------------------
+    def make_summary(self):
+        if not self.current_url:
+            return
+
+        title, body = self.cached_body.get(self.current_url, ("", ""))
+        if not body:
+            return
+
+        lines = body.split("\n")
+        summary = "。".join(lines[:3]) + "。"
+
+        self.txt_summary.delete("1.0", "end")
+        self.txt_summary.insert("end", summary)
+
+        # Excel 出力
+        self.excel.append([
+            datetime.now().isoformat(),
+            self.current_url,
+            title,
+            summary,
+            body
+        ])
+
+# End of Part3
