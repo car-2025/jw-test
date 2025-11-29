@@ -244,6 +244,266 @@ def make_edge_driver(headed=True, driver_path=EDGE_DRIVER_PATH, user_data_dir=ED
 # jw_search_app_v12_edge_fixed10.py — Part2/4
 # === JW.org 公式検索（rel/date）URL収集ロジック ===
 
+# ----------------------------
+# Manual collector: user does one search manually, then this collects from current page
+# ----------------------------
+class JWManualCollector:
+    def __init__(self, headed=True):
+        # Start Edge using the robust factory (uses EDGE_USER_DATA_DIR)
+        self.driver = make_edge_driver(headed=headed)
+        # small safety
+        try:
+            self.driver.set_window_size(1200, 900)
+        except Exception:
+            pass
+        print("JWManualCollector: Edge 起動完了")
+
+    def open_jw_home(self):
+        """Open JW.org Japanese home so user can type search terms manually."""
+        try:
+            self.driver.get(BASE_DOMAIN + "/ja/")
+            # wait a little for page to load and cookie banner
+            time.sleep(1.0)
+            return True
+        except Exception as e:
+            print("open_jw_home failed:", e)
+            return False
+
+    def collect_from_current_pages(self, mode: str, max_items: int):
+        """
+        Starting from currently open JW.org search results page (user has entered query),
+        collect up to max_items article URLs by clicking 'next' as needed.
+        mode: 'relevance' or 'date'  -- this method assumes user already chose sort on the site
+        """
+        collected = []
+        seen = set()
+        # safety limit to avoid infinite loop
+        page_count = 0
+        while len(collected) < max_items and page_count < 20:
+            page_count += 1
+            try:
+                # ensure DOM ready
+                WebDriverWait(self.driver, SELENIUM_PAGE_TIMEOUT).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "main, body"))
+                )
+            except Exception:
+                time.sleep(0.6)
+
+            html = self.driver.page_source
+            # quick check for "お探しのページが見つかりません"
+            if "お探しのページが見つかりません" in html or "該当する結果は見つかりません" in html:
+                print("検索ページが見つかりません（手動検索を確認してください）")
+                break
+
+            # collect anchors that look like article links
+            anchors = self.driver.find_elements(By.CSS_SELECTOR, "a[href]")
+            for a in anchors:
+                try:
+                    href = a.get_attribute("href") or ""
+                except Exception:
+                    continue
+                if not href:
+                    continue
+                href = href.split("#")[0].rstrip("/")
+                if href in seen:
+                    continue
+                # consider only /ja/ pages
+                if not href.startswith(BASE_DOMAIN + "/ja/"):
+                    continue
+                # exclude obvious index/category pages
+                if any(x in href for x in ["/topics/", "/languages/", "/library/", "/search?", "/collections/", "/live/"]):
+                    continue
+                # prefer pages that carry a numeric docid or /d/
+                if extract_docid_from_url(href) is None:
+                    # Not a clear article url — skip
+                    continue
+
+                seen.add(href)
+                collected.append(href)
+                if len(collected) >= max_items:
+                    break
+
+            print(f"[manual collect] page {page_count} found {len(collected)} total")
+
+            if len(collected) >= max_items:
+                break
+
+            # try to find "next page" link/button and click it
+            next_clicked = False
+            # Candidate selectors for next page link - try a few possibilities
+            next_selectors = [
+                "a[rel='next']",
+                "a.pagination__next",
+                "a[aria-label='次へ']",
+                "a[aria-label='Next']",
+                "button[aria-label='次へ']",
+                "button[aria-label='Next']",
+                "a[title*='次へ']",
+            ]
+            for sel in next_selectors:
+                try:
+                    el = self.driver.find_element(By.CSS_SELECTOR, sel)
+                    if el:
+                        try:
+                            self.driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                            time.sleep(0.25)
+                            el.click()
+                            next_clicked = True
+                            time.sleep(1.0 + random.random() * 0.8)
+                            break
+                        except Exception:
+                            # try to click via JS as fallback
+                            try:
+                                href = el.get_attribute("href")
+                                if href:
+                                    self.driver.get(href)
+                                    next_clicked = True
+                                    time.sleep(0.9 + random.random() * 0.6)
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+
+            if not next_clicked:
+                # no next page detection - stop
+                print("次ページリンクが見つかりません。収集を終了します。")
+                break
+
+        return collected[:max_items]
+
+    def close(self):
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+
+# ----------------------------
+# JWAppGUI: add manual-mode UI controls and actions
+# ----------------------------
+# Insert the following methods inside your existing JWAppGUI class (paste into the class body).
+# If you already have similar methods, replace them.
+
+def _add_manual_controls_to_gui(self):
+    """
+    Call this from build_ui() after other top-level widgets are created.
+    Adds buttons: 'JWを開く' (ユーザーが手で検索するためのブラウザ起動)
+                 '収集開始(現在ページから)' (手動検索済みのページをもとに収集)
+    """
+    frame = ttk.Frame(self.master)
+    frame.pack(fill="x", padx=6, pady=4)
+
+    btn_open = ttk.Button(frame, text="JW を開く (手動で検索語入力)", command=self.open_jw_for_manual)
+    btn_open.pack(side="left", padx=6)
+
+    btn_collect = ttk.Button(frame, text="収集開始 (現在ページから)", command=self.start_collection_from_current)
+    btn_collect.pack(side="left", padx=6)
+
+    # small helper label
+    self.lbl_manual = ttk.Label(frame, text="手順：1) JW を開く → 2) 検索語を入力し Enter → 3) 収集開始")
+    self.lbl_manual.pack(side="left", padx=8)
+
+# Add these attributes initializations to JWAppGUI.__init__:
+# self.manual_collector = None
+
+def open_jw_for_manual(self):
+    """Open JW.org for manual search (starts Edge that user can interact with)."""
+    try:
+        # create collector if not exists
+        if not hasattr(self, "manual_collector") or self.manual_collector is None:
+            self.manual_collector = JWManualCollector(headed=True)
+        ok = self.manual_collector.open_jw_home()
+        if not ok:
+            messagebox.showerror("エラー", "ブラウザを開けませんでした。")
+            return
+        messagebox.showinfo("操作", "ブラウザが開きました。検索語を入力して Enter を押してください。\n準備ができたら「収集開始」を押してください。")
+    except Exception as e:
+        messagebox.showerror("例外", f"ブラウザ起動でエラー: {e}")
+
+def start_collection_from_current(self):
+    """
+    Called after user has manually entered a search on JW.org and pressed Enter.
+    Collects rel/date in sequence by switching the sort mode on-site:
+    - First collects current sort (assumed relevance)
+    - Then attempts to switch to '新しい順' (date) by clicking site controls or by manual instruction
+    """
+    if not hasattr(self, "manual_collector") or self.manual_collector is None:
+        messagebox.showwarning("警告", "先に「JW を開く」ボタンでブラウザを開いて、検索語を入力して下さい。")
+        return
+
+    # Ask user which mode to collect now — but we will collect two modes sequentially:
+    rel_n = self.var_rel.get()
+    date_n = self.var_date.get()
+
+    # Run collection in background thread to keep UI responsive
+    def do_collect():
+        try:
+            # 1) collect current sort (assume relevance). User must have left the site in relevance view.
+            self.lbl_manual.config(text="収集中…(関連度)")
+            rel_urls = self.manual_collector.collect_from_current_pages("relevance", rel_n)
+            print(f"[manual] rel collected {len(rel_urls)}")
+
+            # 2) try to switch to date sort on the site UI.
+            # We'll attempt to find a sort control and click "新しい順" automatically.
+            switched = False
+            try:
+                # try common selectors for sort buttons / menu
+                sort_selectors = [
+                    "button[aria-haspopup='listbox']",          # dropdown
+                    "button.sort-toggle",                       # generic
+                    "button[data-sort='date']",
+                    "a[role='option'][data-value='date']",
+                    "a[aria-label*='新しい順']"
+                ]
+                for sel in sort_selectors:
+                    try:
+                        el = self.manual_collector.driver.find_element(By.CSS_SELECTOR, sel)
+                        if el:
+                            try:
+                                el.click()
+                                time.sleep(0.8)
+                                switched = True
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # If automatic switch failed, instruct user to switch manually:
+            if not switched:
+                messagebox.showinfo("手動操作のお願い", "自動で「新しい順」に切り替えられませんでした。\nブラウザで手動で「新しい順」を選択してから「OK」を押してください。")
+
+            self.lbl_manual.config(text="収集中…(新しい順)")
+            date_urls = self.manual_collector.collect_from_current_pages("date", date_n)
+            print(f"[manual] date collected {len(date_urls)}")
+
+            all_urls = []
+            for u in rel_urls + date_urls:
+                if u not in all_urls:
+                    all_urls.append(u)
+
+            # populate tree in main thread
+            def ui_update():
+                self.tree.delete(*self.tree.get_children())
+                for u in all_urls:
+                    self.tree.insert("", "end", values=(u,))
+                messagebox.showinfo("完了", f"収集が完了しました。総件数: {len(all_urls)} 件")
+                self.lbl_manual.config(text="手順：1) JW を開く → 2) 検索語を入力し Enter → 3) 収集開始")
+            self.master.after(10, ui_update)
+
+            # start background body fetch
+            self.tree_items = all_urls
+            threading.Thread(target=self.fetch_body_background, args=(all_urls,), daemon=True).start()
+
+        except Exception as e:
+            print("start_collection_from_current error:", e)
+            messagebox.showerror("例外", f"収集中にエラーが発生しました: {e}")
+            self.lbl_manual.config(text="手順：1) JW を開く → 2) 検索語を入力し Enter → 3) 収集開始")
+
+    threading.Thread(target=do_collect, daemon=True).start()
+
 # ---------------------------------------------------------
 # JW.org 公式検索：正規の検索URLで rel/date ページを巡回してリンク抽出
 # ---------------------------------------------------------
